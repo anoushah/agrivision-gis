@@ -4,3 +4,8 @@ opencv-python-headless
 numpy
 pandas
 pillow
+folium
+streamlit-folium
+shapely
+scipy
+matplotlib
