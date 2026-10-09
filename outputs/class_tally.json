@@ -1,0 +1,16 @@
+{
+  "PlantDoc_Corn leaf blight": {
+    "count": 5,
+    "conf_sum": 14.889761507511139,
+    "conf_n": 20,
+    "conf_min": 0.5700454711914062,
+    "conf_max": 0.922214925289154
+  },
+  "PlantDoc_Peach leaf": {
+    "count": 2,
+    "conf_sum": 2.703134775161743,
+    "conf_n": 4,
+    "conf_min": 0.5937014818191528,
+    "conf_max": 0.8936377763748169
+  }
+}
