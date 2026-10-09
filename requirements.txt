@@ -7,5 +7,11 @@ pillow
 folium
 streamlit-folium
 shapely
+pyproj
 scipy
 matplotlib
+plotly
+requests
+pyyaml
+tqdm
+scikit-learn
