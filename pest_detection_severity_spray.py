@@ -1,36 +1,3 @@
-"""
-Crop Pest & Disease Detection with Precision Spray Simulation (AgriVision)
-------------------------------------------------------------------------
-Supports Multi-Signal Dual-Mode Analysis:
-1. Ground-level YOLO Object Detection (Expanded IP102 & baseline pest/disease classes)
-2. Aerial / Drone YOLO Crop Stress Pattern Detection (Agriculture-Vision 2021 anomalies)
-3. HSV Vegetation Health Signal (Chlorosis yellowing & Necrosis brown spot/bare soil detection)
-4. Texture Anomaly Analysis (Normalized gradient variance for leaf deformation/spots)
-5. Wilting Symptom Proxy (Intra-canopy deep shadow proportion & contour fragmentation)
-6. CLAHE contrast enhancement (pre-detection) for faint spots/discoloration
-7. SAHI sliced inference (tiled detection) for small/distant pests -- GPU only by default
-
-All signals feed into the SAME 3x3 zone severity system. On top of that, a proper GIS layer
-(shapely + pyproj) turns the result into real map geometry:
-
-  outer boundary (user)  ->  detection runs only inside it
-  infected points        ->  every unique pest / stress spot with its real lat/lon
-  inner boundary         ->  buffered convex hull of the infected points (clipped to the outer boundary)
-  spray grid             ->  grid cells generated automatically inside the inner boundary
-
-GROUND-FIXED ZONES: the 3x3 zones are laid over the ground covered by the whole flight (not over
-each camera frame). Drone motion is estimated with optical flow, so a zone keeps the same number
-and GPS position while the drone moves, and overlapping frames are merged (see WORLD-FIXED ZONES).
-
-PERFORMANCE NOTES (CPU machines):
-- Models are cached (lru_cache) so they load ONCE per process, not per run.
-- FRAME_SKIP defaults to 5 on CPU (process every 5th frame).
-- SAHI tiled inference is DISABLED automatically on CPU (it is ~12x slower per
-  frame). Set FORCE_SAHI = True if you explicitly want it back.
-- Frames are downscaled to PROCESS_MAX_WIDTH before inference.
-- Pass progress_callback(done, total) to process_video() for a live progress bar.
-"""
-
 import os
 import cv2
 import random
@@ -61,19 +28,15 @@ except Exception:
     FFMPEG_EXE = None
 
 
-# ---------------------- DEVICE / THREADS ----------------------
 HAS_CUDA = torch.cuda.is_available()
 DEVICE = "cuda:0" if HAS_CUDA else "cpu"
 
-# CPU par PyTorch ko saare cores use karne dein (bara farq padta hai)
 try:
     torch.set_num_threads(os.cpu_count() or 4)
 except Exception:
     pass
 
-# ---------------------- CONFIG ----------------------
-DEFAULT_GROUND_MODEL = r"E:\Ideofuzion\AgriVision\AgriVision\runs\detect\runs\agrivision_local_v2\weights\best.pt"
-LEGACY_MODEL = "best.pt"
+DEFAULT_GROUND_MODEL = str(Path(__file__).resolve().parent / "models" / "ground_best.pt")
 DEFAULT_AERIAL_MODEL = "aerial_best.pt"
 
 DEFAULT_VIDEO = "test_videos/field_footage.mp4"
@@ -81,83 +44,144 @@ DEFAULT_DRONE_VIDEO = "test_videos/crop_field_drone_30s.mp4"
 OUTPUT_VIDEO = "output_annotated.mp4"
 REPORT_PATH = "spray_report.json"
 
-# --- SPEED KNOBS ---
-# GPU hai to har frame; CPU hai to har 5th frame (accuracy pe bohot kam asar,
-# kyunke severity waise bhi p95 aggregate se nikalti hai)
 FRAME_SKIP = 1 if HAS_CUDA else 5
 
-# Inference resolution. CPU par 480 kaafi tez hai, GPU par 640 rakh sakte hain.
 IMG_SIZE = 640 if HAS_CUDA else 480
 
-# Frame ko is width se bara ho to downscale kar dein (inference + zone analysis dono tez)
 PROCESS_MAX_WIDTH = 1280 if HAS_CUDA else 960
 
-# SAHI tiled inference: CPU par ~12x slower per frame. Default: sirf GPU par ON.
 FORCE_SAHI = False
 USE_SAHI = HAS_CUDA or FORCE_SAHI
 
 CONF_THRESHOLD = 0.55
 
-# Adaptive Box Area Filter (Mode-Aware)
+KEEP_CLASS_NAMES = set()
+
+def _fit_text_scale(text, base_scale, thickness, max_width):
+    scale = base_scale
+    while scale > 0.3:
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+        if tw <= max_width:
+            break
+        scale -= 0.05
+    return scale
+
+
+def _draw_fixed_zone_overlay(frame, world, H_cur, zone_overlay):
+    h, w = frame.shape[:2]
+    xs = [int(round(i * w / GRID_COLS)) for i in range(GRID_COLS + 1)]
+    ys = [int(round(j * h / GRID_ROWS)) for j in range(GRID_ROWS + 1)]
+
+    cells = []
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            x0, x1, y0, y1 = xs[c], xs[c + 1], ys[r], ys[r + 1]
+            wx, wy = world.point_to_world(H_cur, (x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            zone = world.world_to_cell(wx, wy)
+            info = zone_overlay.get(zone)
+            if info is not None:
+                cells.append((x0, y0, x1, y1, zone, info))
+
+    tint = frame.copy()
+    tinted = False
+    for x0, y0, x1, y1, _zone, info in cells:
+        if info["severity"] != "none":
+            cv2.rectangle(tint, (x0, y0), (x1, y1), COLORS[info["severity"]], -1)
+            tinted = True
+    if tinted:
+        cv2.addWeighted(tint, 0.18, frame, 0.82, 0, frame)
+
+    white = (255, 255, 255)
+    for x in xs[1:-1]:
+        cv2.line(frame, (x, 0), (x, h - 1), white, 2, cv2.LINE_AA)
+    for y in ys[1:-1]:
+        cv2.line(frame, (0, y), (w - 1, y), white, 2, cv2.LINE_AA)
+    cv2.rectangle(frame, (0, 0), (w - 1, h - 1), white, 2, cv2.LINE_AA)
+
+    for x0, y0, x1, y1, (row, col), info in cells:
+        severity = info["severity"]
+        zone_label = f"Z{row * GRID_COLS + col + 1}"
+        cv2.putText(frame, zone_label, (x0 + 5, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+        if severity == "none":
+            continue
+
+        color = COLORS[severity]
+        dose = SPRAY_DOSE[severity]
+        label = f"{severity.upper()} - Spray {dose}%"
+        sub_label = f"Discolor:{info['unhealthy_ratio'] * 100:.1f}% Tex:{info['tex_anomaly']:.2f}"
+
+        max_w = (x1 - x0) - 20
+        label_scale = _fit_text_scale(label, 0.6, 2, max_w)
+        sub_scale = _fit_text_scale(sub_label, 0.45, 1, max_w)
+        label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, label_scale, 2)
+        sub_size, _ = cv2.getTextSize(sub_label, cv2.FONT_HERSHEY_SIMPLEX, sub_scale, 1)
+        box_right = x0 + 15 + max(label_size[0], sub_size[0])
+        cv2.rectangle(frame, (x0 + 5, y0 + 5), (box_right, y0 + 45), color, -1)
+        cv2.putText(frame, label, (x0 + 10, y0 + 23),
+                    cv2.FONT_HERSHEY_SIMPLEX, label_scale, (255, 255, 255), 2)
+        cv2.putText(frame, sub_label, (x0 + 10, y0 + 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, sub_scale, (255, 255, 255), 1)
+
+        if info["lat"] is not None and info["lon"] is not None:
+            gps_label = f"GPS: {info['lat']}, {info['lon']}"
+            gps_scale = _fit_text_scale(gps_label, 0.5, 2, max_w)
+            gps_size, _ = cv2.getTextSize(gps_label, cv2.FONT_HERSHEY_SIMPLEX, gps_scale, 2)
+            gps_y = y1 - 30
+            cv2.rectangle(frame, (x0 + 5, gps_y - 18),
+                          (x0 + 15 + gps_size[0], gps_y + 6), (87, 95, 15), -1)
+            cv2.putText(frame, gps_label, (x0 + 10, gps_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, gps_scale, (0, 255, 255), 2)
+
+        rng = random.Random(row * GRID_COLS + col + 1)
+        for _ in range(int(dose / 10)):
+            dx = rng.randint(x0 + 10, max(x0 + 11, x1 - 10))
+            dy = rng.randint(y0 + 55, max(y0 + 56, y1 - 10))
+            cv2.circle(frame, (dx, dy), 4, (255, 200, 0), -1)
+            cv2.circle(frame, (dx, dy), 6, (255, 200, 0), 1)
+
+        cv2.putText(frame, "SPRAYING...", (x0 + 10, y1 - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+
+
+def resolve_keep_ids(class_map, keep_names=None):
+    keep = {str(n).strip().lower() for n in (KEEP_CLASS_NAMES if keep_names is None else keep_names)}
+    if not keep:
+        return None, []
+    name_to_id = {str(n).strip().lower(): int(i) for i, n in dict(class_map).items()}
+    ids = sorted(name_to_id[n] for n in keep if n in name_to_id)
+    missing = sorted(n for n in keep if n not in name_to_id)
+    return (ids or None), missing
+
 MAX_BOX_FRAME_RATIO_GROUND = 0.10
 MAX_BOX_FRAME_RATIO_AERIAL = 0.60
 HIGH_CONF_REQUIRED_FOR_LARGE_BOX = 0.85
 
+ZONE_FIT_VERSION = 2
 GRID_ROWS = 3
 GRID_COLS = 3
 
-# --- GIS (no demo coordinates: every coordinate comes from the user's outer boundary) ---
-DEFAULT_INNER_MARGIN_M = 5.0     # buffer added around the infected points' convex hull
-DEFAULT_GRID_CELL_M = 10.0       # spray-grid cell size inside the inner boundary
-MAX_GRID_CELLS = 150             # the cell size is increased automatically above this
-MIN_GRID_CELL_COVER = 0.25       # a grid cell is kept only if >= 25% of it lies inside the inner boundary
-GEO_FIT_MODE = "contain"         # "contain": uniform scale (keeps shapes), "stretch": fill the boundary bbox
+DEFAULT_INNER_MARGIN_M = 5.0
+DEFAULT_GRID_CELL_M = 10.0
+MAX_GRID_CELLS = 150
+MIN_GRID_CELL_COVER = 0.25
 _GEOD = Geod(ellps="WGS84")
 
-# --- WORLD-FIXED ZONES (drone motion compensation) ---
-# The 3x3 zones are laid over the GROUND covered by the whole flight instead of over each camera
-# frame, so a zone keeps describing the same piece of field while the drone moves.
-MOTION_COMPENSATION = True          # False = old behaviour (zones fixed to the camera frame)
-MOTION_EST_WIDTH = 320              # frames are downscaled to this width for motion estimation (fast)
-MIN_CELL_VISIBLE_FRACTION = 0.04    # a zone counts in a frame only if >= 4% of the frame shows it
-TRACK_MATCH_DISTANCE_WORLD_PX = 90.0  # same-class detections closer than this (ground px) = same pest
-PASS1_PROGRESS_SHARE = 0.10         # share of the progress bar used by the motion-estimation pass
+MOTION_COMPENSATION = True
+MOTION_EST_WIDTH = 320
+MIN_CELL_VISIBLE_FRACTION = 0.04
+TRACK_MATCH_DISTANCE_WORLD_PX = 90.0
+PASS1_PROGRESS_SHARE = 0.10
 
-
-
-# ==================================================================
-# WORLD-FIXED ZONES (DRONE MOTION COMPENSATION)
-# ==================================================================
-# PROBLEM: a 3x3 grid fixed to the CAMERA FRAME does not describe the field. When the drone
-# moves, "zone 5" (image centre) shows different ground in every frame, the same ground shows
-# up in different zones, and overlapping frames count the same pest twice.
-#
-# FIX: estimate the camera motion between frames and put every frame into ONE common world
-# coordinate system (world = pixel space of the first frame). The 3x3 zones are laid over the
-# whole ground area covered by the flight, so:
-#   * a zone is always the same piece of ground (same number Z1..Z9, same GPS position),
-#   * each frame only contributes the part of a zone that it can actually see,
-#   * where frames overlap, the observations of a zone are merged (percentile over all frames),
-#   * pests are tracked in world coordinates, so they are counted once, not once per frame.
 
 class GlobalMotionEstimator:
-    """
-    Frame-to-frame camera motion (translation + rotation + uniform scale) for a top-down drone
-    view, estimated with sparse Lucas-Kanade optical flow and a RANSAC similarity transform.
-
-    update(frame) returns a 3x3 matrix H that maps FRAME pixel coordinates -> WORLD coordinates.
-    The first frame defines the world (H = identity). If a step cannot be estimated (blur, no
-    texture) the previous motion is reused ("constant velocity") and counted in `failures`.
-
-    LIMITATION: motion is chained frame by frame, so long flights can slowly drift. Real GPS/IMU
-    telemetry would remove the drift; this needs no extra hardware or files.
-    """
 
     def __init__(self, est_width=MOTION_EST_WIDTH):
         self.est_width = est_width
         self.prev_gray = None
         self.H_world = np.eye(3, dtype=np.float64)
-        self.last_step = np.eye(3, dtype=np.float64)   # last good (current -> previous) transform
+        self.last_step = np.eye(3, dtype=np.float64)
         self.failures = 0
         self.frames = 0
 
@@ -187,7 +211,6 @@ class GlobalMotionEstimator:
 
     @staticmethod
     def _estimate_step(prev_gray, cur_gray, s):
-        """Transform mapping current-frame pixels -> previous-frame pixels (full resolution), or None."""
         pts_prev = cv2.goodFeaturesToTrack(prev_gray, maxCorners=400, qualityLevel=0.01,
                                            minDistance=8, blockSize=7)
         if pts_prev is None or len(pts_prev) < 12:
@@ -203,28 +226,23 @@ class GlobalMotionEstimator:
         if int(ok.sum()) < 12:
             return None
 
-        src = pts_cur[ok].reshape(-1, 2)     # points in the current frame
-        dst = pts_prev[ok].reshape(-1, 2)    # the same points in the previous frame
+        src = pts_cur[ok].reshape(-1, 2)
+        dst = pts_prev[ok].reshape(-1, 2)
         A, inliers = cv2.estimateAffinePartial2D(
             src, dst, method=cv2.RANSAC, ransacReprojThreshold=3.0, maxIters=2000, confidence=0.99)
         if A is None or inliers is None or int(inliers.sum()) < max(10, int(0.3 * int(ok.sum()))):
             return None
 
         scale_change = math.hypot(A[0, 0], A[1, 0])
-        if not (0.8 <= scale_change <= 1.25):      # implausible zoom between two frames -> reject
+        if not (0.8 <= scale_change <= 1.25):
             return None
 
-        # The estimate lives in downscaled pixels; convert it back to full-resolution pixels
         S = np.diag([s, s, 1.0])
         A3 = np.vstack([A, [0.0, 0.0, 1.0]])
         return np.linalg.inv(S) @ A3 @ S
 
 
 class WorldGrid:
-    """
-    GRID_ROWS x GRID_COLS zones laid over the WHOLE ground area covered by the flight
-    (bounding box of all camera footprints, in world pixels).
-    """
 
     def __init__(self, homographies, frame_w, frame_h, rows, cols):
         corners = np.array([[0, 0], [frame_w, 0], [frame_w, frame_h], [0, frame_h]],
@@ -241,12 +259,10 @@ class WorldGrid:
 
     @staticmethod
     def point_to_world(H, x, y):
-        """Map one frame pixel (x, y) to world coordinates using the frame's matrix H."""
         p = H @ np.array([x, y, 1.0])
         return float(p[0] / p[2]), float(p[1] / p[2])
 
     def world_to_cell(self, wx, wy):
-        """Ground-fixed zone (row, col) that contains the world point (clamped to the grid)."""
         col = int(min(max(math.floor((wx - self.x0) / self.cell_w), 0), self.cols - 1))
         row = int(min(max(math.floor((wy - self.y0) / self.cell_h), 0), self.rows - 1))
         return row, col
@@ -257,14 +273,6 @@ class WorldGrid:
         return np.array([[xa, ya], [xb, ya], [xb, yb], [xa, yb]], dtype=np.float64)
 
     def project_cell(self, row, col, H_inv, width, height, min_visible_px):
-        """
-        Project one ground zone into the current camera frame (H_inv: world -> frame pixels).
-        Returns None if the zone is not (sufficiently) visible, otherwise a dict with:
-          x0,y0,x1,y1  bounding rectangle of the VISIBLE part (clipped to the frame)
-          mask         uint8 mask (rect-sized), 255 = pixels that belong to this zone
-          poly         zone outline in frame pixels (for drawing)
-          visible_px   number of visible zone pixels
-        """
         poly = cv2.perspectiveTransform(self.cell_corners(row, col).reshape(-1, 1, 2),
                                         np.asarray(H_inv, dtype=np.float64)).reshape(-1, 2)
         poly = np.clip(poly, -1e5, 1e5)
@@ -287,26 +295,12 @@ class WorldGrid:
                 "mask": mask, "poly": poly_int, "visible_px": visible_px}
 
 
-# ==================================================================
-# GIS LAYER (shapely + pyproj)  -- the ONLY geometry implementation in the project
-# ==================================================================
-# All coordinates come from the user's outer boundary. Nothing falls back to a fixed location.
-#   * Outer boundary  : shapely Polygon (lon, lat), built from the vertices the user drew.
-#   * Geo-referencing : the flown ground area (world pixels) is fitted onto the boundary in the
-#                       local UTM zone (metres), north-up. No GPS/IMU telemetry is needed, but the
-#                       accuracy is only as good as the assumption "the video covers the boundary".
-#   * Infected points : unique detections (mean ground position) + crop-stress centroids.
-#   * Inner boundary  : convex hull of the infected points + margin, clipped to the outer boundary.
-#   * Spray grid      : square cells generated inside the inner boundary.
-
 def geo_distance_m(lat1, lon1, lat2, lon2):
-    """Geodesic distance in metres on the WGS84 ellipsoid."""
     _, _, dist = _GEOD.inv(lon1, lat1, lon2, lat2)
     return float(dist)
 
 
 def _make_projectors(lat, lon):
-    """(to_metres, to_lonlat) shapely-geometry functions using the local UTM zone."""
     zone = max(1, min(60, int((lon + 180.0) // 6.0) + 1))
     epsg = (32600 if lat >= 0 else 32700) + zone
     fwd = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
@@ -315,7 +309,6 @@ def _make_projectors(lat, lon):
 
 
 def _polygons_of(geom):
-    """List of non-empty Polygons contained in any shapely geometry."""
     if geom is None or geom.is_empty:
         return []
     if geom.geom_type == "Polygon":
@@ -324,24 +317,19 @@ def _polygons_of(geom):
 
 
 def _only_polygons(geom):
-    """Drop stray lines/points from an intersection result."""
     return unary_union(_polygons_of(geom))
 
 
 def _rings(geom_ll):
-    """Exterior rings as [[lat, lon], ...] (one list per polygon) for folium."""
     return [[[y, x] for x, y in p.exterior.coords] for p in _polygons_of(geom_ll)]
 
 
 def _inner_point(geom):
-    """A representative point that is guaranteed to lie inside the geometry."""
     c = geom.centroid
     return c if geom.contains(c) else geom.representative_point()
 
 
 def boundary_polygon(boundary):
-    """Valid shapely Polygon (lon, lat) from boundary vertices, or None.
-    Accepts [{"lat":..,"lon":..}, ...] or [(lat, lon), ...]."""
     if not boundary:
         return None
     pts = []
@@ -365,7 +353,6 @@ def boundary_polygon(boundary):
 
 
 def view_for_polygon(poly_ll):
-    """(centre [lat, lon], zoom) that fits a lon/lat polygon on the map."""
     minx, miny, maxx, maxy = poly_ll.bounds
     clat, clon = (miny + maxy) / 2.0, (minx + maxx) / 2.0
     extent_m = max(
@@ -377,11 +364,40 @@ def view_for_polygon(poly_ll):
     return [clat, clon], int(max(3, min(19, math.floor(zoom))))
 
 
+def _equal_area_cuts(geom, axis, n):
+    minx, miny, maxx, maxy = geom.bounds
+    lo, hi = (minx, maxx) if axis == 0 else (miny, maxy)
+    uniform = [lo + (hi - lo) * i / n for i in range(n + 1)]
+    total = geom.area
+    if total <= 0 or hi - lo <= 1e-9:
+        return uniform
+    pad = 1.0
+
+    def area_below(t):
+        if axis == 0:
+            part = box(minx - pad, miny - pad, t, maxy + pad)
+        else:
+            part = box(minx - pad, miny - pad, maxx + pad, t)
+        return geom.intersection(part).area
+
+    cuts = [lo]
+    for k in range(1, n):
+        target = total * k / n
+        a, b = lo, hi
+        for _ in range(48):
+            mid = (a + b) / 2.0
+            if area_below(mid) < target:
+                a = mid
+            else:
+                b = mid
+        cuts.append((a + b) / 2.0)
+    cuts.append(hi)
+    if any(cuts[i + 1] - cuts[i] <= 1e-6 for i in range(n)):
+        return uniform
+    return cuts
+
+
 class GeoReference:
-    """
-    World pixels (flown ground area) -> metres (local UTM) -> lon/lat, fitted onto the outer boundary.
-    The flown area is centred on the boundary's bounding box, north-up (world y grows to the south).
-    """
 
     def __init__(self, outer_ll, world):
         self.outer_ll = outer_ll
@@ -389,23 +405,53 @@ class GeoReference:
         self.to_m, self.to_ll, self._fwd, self._inv = _make_projectors(ctr.y, ctr.x)
         self.outer_m = self.to_m(outer_ll)
         self._outer_prep = prep(self.outer_m)
+        self._w = world
+        self.rows, self.cols = world.rows, world.cols
 
         minx, miny, maxx, maxy = self.outer_m.bounds
+        self.bounds_m = (minx, miny, maxx, maxy)
+        y_cuts = _equal_area_cuts(self.outer_m, 1, self.rows)
+        self.row_edges = [y_cuts[self.rows - i] for i in range(self.rows + 1)]
+        self.col_edges = []
+        for r in range(self.rows):
+            top, bot = self.row_edges[r], self.row_edges[r + 1]
+            slab = _only_polygons(self.outer_m.intersection(box(minx - 1.0, bot, maxx + 1.0, top)))
+            if slab.is_empty:
+                sminx, smaxx_ = minx, maxx
+                self.col_edges.append([sminx + (smaxx_ - sminx) * i / self.cols for i in range(self.cols + 1)])
+            else:
+                self.col_edges.append(_equal_area_cuts(slab, 0, self.cols))
+
         ww = max(world.x1 - world.x0, 1e-6)
         wh = max(world.y1 - world.y0, 1e-6)
-        sx, sy = (maxx - minx) / ww, (maxy - miny) / wh
-        if GEO_FIT_MODE != "stretch":
-            sx = sy = min(sx, sy)
-        self.sx, self.sy = max(sx, 1e-9), max(sy, 1e-9)          # metres per world pixel
-        self.wcx, self.wcy = (world.x0 + world.x1) / 2.0, (world.y0 + world.y1) / 2.0
-        self.mcx, self.mcy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-        self.gsd = float(0.5 * (self.sx + self.sy))
+        self.gsd = float(math.sqrt(max(self.outer_m.area, 1e-9) / (ww * wh)))
+
+    def _cell_of_world(self, wx, wy):
+        w = self._w
+        fy = (wy - w.y0) / w.cell_h
+        fx = (wx - w.x0) / w.cell_w
+        r = int(min(max(math.floor(fy), 0), self.rows - 1))
+        c = int(min(max(math.floor(fx), 0), self.cols - 1))
+        return r, c, fx - c, fy - r
+
+    def _cell_to_m(self, r, c, u, v):
+        top, bot = self.row_edges[r], self.row_edges[r + 1]
+        left, right = self.col_edges[r][c], self.col_edges[r][c + 1]
+        return left + u * (right - left), top + v * (bot - top)
 
     def world_to_m(self, wx, wy):
-        return self.mcx + self.sx * (wx - self.wcx), self.mcy - self.sy * (wy - self.wcy)
+        r, c, u, v = self._cell_of_world(wx, wy)
+        return self._cell_to_m(r, c, u, v)
 
-    def m_to_world(self, X, Y):
-        return self.wcx + (X - self.mcx) / self.sx, self.wcy - (Y - self.mcy) / self.sy
+    def _m_to_world_in_cell(self, r, c, X, Y):
+        w = self._w
+        top, bot = self.row_edges[r], self.row_edges[r + 1]
+        left, right = self.col_edges[r][c], self.col_edges[r][c + 1]
+        dv = bot - top
+        du = right - left
+        v = (Y - top) / (dv if abs(dv) > 1e-9 else 1e-9)
+        u = (X - left) / (du if abs(du) > 1e-9 else 1e-9)
+        return w.x0 + (c + u) * w.cell_w, w.y0 + (r + v) * w.cell_h
 
     def world_to_lonlat(self, wx, wy):
         X, Y = self.world_to_m(wx, wy)
@@ -413,21 +459,31 @@ class GeoReference:
         return float(lon), float(lat)
 
     def contains_world(self, wx, wy):
-        """True if the ground point lies inside (or on) the user's outer boundary."""
         X, Y = self.world_to_m(wx, wy)
         return bool(self._outer_prep.covers(Point(X, Y)))
 
+    def zone_box_m(self, row, col):
+        minx, miny, maxx, maxy = self.bounds_m
+        top = self.row_edges[row] + (1.0 if row == 0 else 0.0)
+        bot = self.row_edges[row + 1] - (1.0 if row == self.rows - 1 else 0.0)
+        left = self.col_edges[row][col] - (1.0 if col == 0 else 0.0)
+        right = self.col_edges[row][col + 1] + (1.0 if col == self.cols - 1 else 0.0)
+        return box(left, bot, right, top)
+
     def field_polygon_world(self):
-        """Outer boundary as an (N, 2) float array of world pixels (for the per-frame field mask)."""
-        pts = [self.m_to_world(x, y) for x, y in self.outer_m.exterior.coords]
-        return np.array(pts, dtype=np.float64)
+        out = []
+        for r in range(self.rows):
+            for c in range(self.cols):
+                part = _only_polygons(self.outer_m.intersection(self.zone_box_m(r, c)))
+                for poly in _polygons_of(part):
+                    pts = [self._m_to_world_in_cell(r, c, x, y) for x, y in poly.exterior.coords]
+                    out.append(np.array(pts, dtype=np.float64))
+        return out
 
     def zone_polygon_m(self, world, row, col):
-        corners = world.cell_corners(row, col)
-        return Polygon([self.world_to_m(x, y) for x, y in corners])
+        return self.zone_box_m(row, col)
 
     def zone_geo(self, world, rows, cols):
-        """{zone_id: {lat, lon, has_area, rings}}: each analysis zone clipped to the outer boundary."""
         out = {}
         for r in range(rows):
             for c in range(cols):
@@ -446,13 +502,6 @@ class GeoReference:
 
 
 def build_spray_layers(outer_ll, infected, zone_geo, margin_m, cell_m):
-    """
-    Automatic GIS flow (used by the pipeline and by the dashboard when margin / cell size change):
-      infected points -> inner boundary (convex hull + margin, clipped to the outer boundary)
-                      -> spray grid inside the inner boundary.
-    infected : list of dicts with at least lat, lon, severity (+ optional zone_id, pests, ...)
-    zone_geo : {zone_id: {..., "rings": [[[lat, lon], ...]]}} used to tell which zone a cell is in
-    """
     ctr = outer_ll.centroid
     to_m, to_ll, _, _ = _make_projectors(ctr.y, ctr.x)
     outer_m = to_m(outer_ll)
@@ -469,7 +518,7 @@ def build_spray_layers(outer_ll, infected, zone_geo, margin_m, cell_m):
     inner_rings, grid, inner_area = [], [], 0.0
     cell_used = max(1.0, float(cell_m))
     if pts_m:
-        hull = MultiPoint(pts_m).convex_hull               # Point / LineString / Polygon
+        hull = MultiPoint(pts_m).convex_hull
         buf = float(margin_m) if margin_m > 0 else (0.0 if hull.geom_type == "Polygon" else 1.0)
         inner_m = hull.buffer(buf) if buf > 0 else hull
         inner_m = _only_polygons(inner_m.intersection(outer_m))
@@ -481,15 +530,35 @@ def build_spray_layers(outer_ll, infected, zone_geo, margin_m, cell_m):
                 cell_used *= 1.25
             nx = max(1, int(math.ceil((ix1 - ix0) / cell_used)))
             ny = max(1, int(math.ceil((iy1 - iy0) / cell_used)))
-            n = 0
+            full_cells, small_cells = [], []
             for j in range(ny):
                 for i in range(nx):
                     cx0 = ix0 + i * cell_used
                     cy1 = iy1 - j * cell_used
                     gcell = box(cx0, cy1 - cell_used, cx0 + cell_used, cy1)
                     gpart = _only_polygons(gcell.intersection(inner_m))
-                    if gpart.is_empty or gpart.area < MIN_GRID_CELL_COVER * gcell.area:
+                    if gpart.is_empty or gpart.area < 1e-6:
                         continue
+                    entry = {"order": j * nx + i, "geom": gpart}
+                    if gpart.area >= MIN_GRID_CELL_COVER * gcell.area:
+                        full_cells.append(entry)
+                    else:
+                        small_cells.append(entry)
+            kept = list(full_cells)
+            for sc in sorted(small_cells, key=lambda e: -e["geom"].area):
+                best, best_len = None, 0.0
+                for kc in kept:
+                    shared = sc["geom"].intersection(kc["geom"]).length
+                    if shared > best_len:
+                        best, best_len = kc, shared
+                if best is None:
+                    kept.append(sc)
+                else:
+                    best["geom"] = _only_polygons(unary_union([best["geom"], sc["geom"]]).buffer(1e-7).buffer(-1e-7))
+            kept.sort(key=lambda e: e["order"])
+            n = 0
+            for kc in kept:
+                    gpart = kc["geom"]
                     n += 1
                     c_m = _inner_point(gpart)
                     c_ll = to_ll(c_m)
@@ -502,7 +571,6 @@ def build_spray_layers(outer_ll, infected, zone_geo, margin_m, cell_m):
                     if zone_id is None and zone_polys_m:
                         zone_id = min(zone_polys_m, key=lambda z: zone_polys_m[z].distance(c_m))
 
-                    # severity / dose of a cell = that of the nearest infected point
                     k = min(range(len(pts_m)), key=lambda q: pts_m[q].distance(c_m))
                     sev = infected[k].get("severity", "low")
                     if sev == "none":
@@ -532,11 +600,6 @@ def build_spray_layers(outer_ll, infected, zone_geo, margin_m, cell_m):
 
 
 def estimate_flight_geometry(video_path, skip, width, height, total_src_frames, progress_callback=None):
-    """
-    Pass 1 (cheap): read the video once and estimate the camera pose of every frame that
-    pass 2 will process (same frame_skip, same resize). Returns (matrices, estimator) where
-    matrices[i] maps the i-th processed frame's pixels to world coordinates.
-    """
     estimator = GlobalMotionEstimator()
     cap = cv2.VideoCapture(video_path)
     homographies = []
@@ -563,7 +626,6 @@ def estimate_flight_geometry(video_path, skip, width, height, total_src_frames, 
 
 
 def compute_box_iou(boxA, boxB):
-    """Compute Intersection over Union (IoU) between two boxes [x1, y1, x2, y2]."""
     xA = max(boxA[0], boxB[0])
     yA = max(boxA[1], boxB[1])
     xB = min(boxA[2], boxB[2])
@@ -579,11 +641,6 @@ def compute_box_iou(boxA, boxB):
 
 
 def suppress_overlapping_boxes(all_detected_boxes, iou_threshold=0.45):
-    """
-    Intra-Frame Non-Maximum Suppression (NMS):
-    Deduplicates overlapping predictions across ground YOLO, aerial YOLO,
-    and SAHI sliced tiles within the SAME frame.
-    """
     if not all_detected_boxes:
         return []
 
@@ -622,32 +679,21 @@ def suppress_overlapping_boxes(all_detected_boxes, iou_threshold=0.45):
 
 
 class SpatialTemporalTracker:
-    """
-    Inter-Frame Spatial-Temporal Tracking & Deduplication:
-    Tracks pests across consecutive frames as the drone flies over the crop field.
-    Prevents double-counting the exact same pest visible in multiple overlapping frames.
-    """
     def __init__(self, max_disappeared_frames=10, distance_threshold_px=90.0):
         self.next_track_id = 1
-        self.tracks = {}  # track_id -> {"centroid": (cx, cy), "label": str, "zone": (r, c), "disappeared": 0}
+        self.tracks = {}
         self.max_disappeared = max_disappeared_frames
         self.distance_threshold = distance_threshold_px
         self.unique_zone_pest_counts = {(r, c): {} for r in range(GRID_ROWS) for c in range(GRID_COLS)}
         self.total_unique_pests = {}
 
     def update(self, current_frame_detections):
-        """
-        current_frame_detections: list of dicts with {"cx": float, "cy": float, "label": str, "row": int, "col": int}
-        Optional "wx"/"wy" = world (ground) coordinates. When present they are used for matching
-        instead of the frame pixels, which makes tracking independent of the drone motion.
-        """
         for tid in list(self.tracks.keys()):
             self.tracks[tid]["disappeared"] += 1
 
         annotated_dets = []
 
         for det in current_frame_detections:
-            # Prefer world (ground) coordinates so matching keeps working while the drone moves
             cx, cy = det.get("wx", det["cx"]), det.get("wy", det["cy"])
             label = det["label"]
             r, c = det["row"], det["col"]
@@ -697,26 +743,24 @@ class SpatialTemporalTracker:
         return annotated_dets
 
 SEVERITY_THRESHOLDS = {
-    "low": 0.10,     # 10% zone coverage/discoloration -> low
-    "medium": 0.25,  # 25% -> medium
-    # >=45% -> high
+    "low": 0.10,
+    "medium": 0.25,
 }
 
 SPRAY_DOSE = {
     "none": 0,
-    "low": 30,      # % of full dose
+    "low": 30,
     "medium": 60,
     "high": 100,
 }
 
 COLORS = {
     "none": (200, 200, 200),
-    "low": (0, 255, 255),      # yellow
-    "medium": (0, 165, 255),   # orange
-    "high": (0, 0, 255),       # red
+    "low": (0, 255, 255),
+    "medium": (0, 165, 255),
+    "high": (0, 0, 255),
 }
 
-# Legacy 14 Ground Class Names Map
 LEGACY_CLASS_NAME_MAP = {
     0: "Powdery Mildew",
     1: "Bacterial Leaf Blight",
@@ -734,7 +778,6 @@ LEGACY_CLASS_NAME_MAP = {
     13: "Corn Rust",
 }
 
-# IP102 102 Ground Pest/Disease Names
 IP102_CLASS_NAMES = [
     'rice leaf roller', 'rice leaf caterpillar', 'paddy stem maggot', 'asiatic rice borer', 'yellow rice borer',
     'rice gall midge', 'Rice Stemfly', 'brown plant hopper', 'white backed plant hopper', 'small brown plant hopper',
@@ -756,7 +799,6 @@ IP102_CLASS_NAMES = [
     'Cicadellidae'
 ]
 
-# Agriculture-Vision Aerial Anomaly Names
 AERIAL_CLASS_NAMES = [
     "weed_cluster", "nutrient_deficiency", "drydown", "water",
     "storm_damage", "planter_skip", "double_plant", "endrow", "waterway"
@@ -764,8 +806,6 @@ AERIAL_CLASS_NAMES = [
 
 
 def apply_clahe(frame):
-    """Contrast enhancement so faint spots/discoloration become more detectable
-    before the frame is handed to the detector."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -775,7 +815,6 @@ def apply_clahe(frame):
 
 
 class _XYXY:
-    """Wraps a plain list so it supports .tolist() like ultralytics tensors do."""
     def __init__(self, vals):
         self.vals = vals
 
@@ -784,8 +823,6 @@ class _XYXY:
 
 
 class PseudoBox:
-    """Makes a SAHI prediction look like an ultralytics box, so the rest of the
-    script (which expects box.xyxy[0], box.conf[0], box.cls[0]) works unchanged."""
     def __init__(self, x1, y1, x2, y2, conf, cls_id):
         self.xyxy = [_XYXY([x1, y1, x2, y2])]
         self.conf = [conf]
@@ -793,7 +830,6 @@ class PseudoBox:
 
 
 def resolve_video_path(requested_path):
-    """Robust resolution for video path across root and test_videos subfolder."""
     p = Path(requested_path)
     if p.exists():
         return str(p)
@@ -807,7 +843,6 @@ def resolve_video_path(requested_path):
 
 
 def get_severity_from_ratio(ratio, det_cnt=0, mode="combined"):
-    """Map a combined severity ratio (0.0 to 1.0) and detection count to severity label."""
     if mode == "ground" and det_cnt == 0 and ratio < 0.10:
         return "none"
     if ratio < 0.10:
@@ -821,12 +856,6 @@ def get_severity_from_ratio(ratio, det_cnt=0, mode="combined"):
 
 
 def analyze_zone_color(zone_bgr, mask=None):
-    """
-    HSV color space analysis for vegetation health cross-check.
-    Classifies pixels into Healthy Green Canopy, Chlorosis (Yellowing), and Necrosis (Brown spot/bare soil).
-    mask: optional uint8 mask (same height/width as zone_bgr). Only pixels with mask > 0 are analysed
-          (used when a ground zone is only partly inside the camera view).
-    """
     hsv = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     total_pixels = max(1, zone_bgr.shape[0] * zone_bgr.shape[1])
@@ -847,7 +876,6 @@ def analyze_zone_color(zone_bgr, mask=None):
     unhealthy_count = chlorosis_count + necrosis_count
     canopy_count = healthy_count + unhealthy_count
 
-    # Centre of the unhealthy pixels (crop coordinates) -> real position of the stress spot
     unhealthy_cx = unhealthy_cy = None
     if unhealthy_count > 0:
         m = cv2.moments((chlorosis | necrosis).astype(np.uint8), binaryImage=True)
@@ -871,11 +899,6 @@ def analyze_zone_color(zone_bgr, mask=None):
 
 
 def analyze_zone_texture(zone_bgr, mask=None):
-    """
-    Computes spatial texture roughness anomaly using normalized intensity variance.
-    Smooth healthy leaves have consistent texture, while spotty or deformed
-    leaves produce elevated intensity variations.
-    """
     gray = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2GRAY)
     values = gray[mask > 0] if mask is not None else gray
     if values.size == 0:
@@ -892,12 +915,6 @@ def analyze_zone_texture(zone_bgr, mask=None):
 
 
 def analyze_zone_wilting(zone_bgr, mask=None):
-    """
-    Heuristic for wilting / drooping leaves:
-    Combines intra-canopy deep shadow ratio (V < 15, S < 20) and edge density.
-    LIMITATION NOTE: 2D RGB top-down video lacks 3D depth / thermal IR data.
-    Drooping is estimated via shadow proportion and irregular edge density proxies.
-    """
     hsv = cv2.cvtColor(zone_bgr, cv2.COLOR_BGR2HSV)
     s_c, v_c = hsv[:, :, 1], hsv[:, :, 2]
     total_pixels = max(1, zone_bgr.shape[0] * zone_bgr.shape[1])
@@ -922,11 +939,6 @@ def analyze_zone_wilting(zone_bgr, mask=None):
     }
 
 
-# Offline, general-agriculture-practice prevention knowledge base.
-# Matched by KEYWORD against the detected class name (case-insensitive substring match).
-# This is NOT learned by the YOLO model -- it is a static lookup the dashboard
-# consults after detection. Classes that match nothing return None, and the
-# dashboard must say "not available" rather than inventing advice.
 PREVENTION_KB = {
     "aphid": "Encourage natural predators (ladybugs, lacewings); use insecticidal soap or neem oil spray; avoid excess nitrogen fertilizer which attracts aphids.",
     "borer": "Remove and destroy infested stalks/stems after harvest; use pheromone traps to monitor adult moth activity; rotate crops to break the pest's life cycle.",
@@ -952,8 +964,6 @@ PREVENTION_KB = {
 
 
 def get_prevention_advice(class_label):
-    """Return prevention advice by keyword match, or None if nothing matches
-    (the caller must show 'not available' rather than fabricating advice)."""
     label_lower = class_label.lower()
     for keyword, advice in PREVENTION_KB.items():
         if keyword in label_lower:
@@ -963,12 +973,6 @@ def get_prevention_advice(class_label):
 
 @lru_cache(maxsize=1)
 def load_models(use_sahi=USE_SAHI):
-    """Load ground and aerial models with appropriate fallbacks.
-
-    CACHED: yeh function poore process mein sirf ek baar chalta hai. Streamlit
-    har button click pe script dobara chalata hai, lekin lru_cache ki wajah se
-    weights sirf pehli dafa disk se load hote hain -- baad mein memory se.
-    """
     ground_model = None
     aerial_model = None
     sahi_ground_model = None
@@ -1001,13 +1005,9 @@ def load_models(use_sahi=USE_SAHI):
             print(msg)
             warnings.append(msg)
 
-    elif Path(LEGACY_MODEL).exists():
-        print(f"Loading legacy ground model: {LEGACY_MODEL}  [device={DEVICE}]")
-        ground_model = YOLO(LEGACY_MODEL)
-        ground_class_map = LEGACY_CLASS_NAME_MAP
     else:
-        msg = (f"No ground model weights found (checked '{DEFAULT_GROUND_MODEL}' and "
-               f"'{LEGACY_MODEL}'). Ground detections will be empty until the path is fixed.")
+        msg = (f"No ground model weights found (checked '{DEFAULT_GROUND_MODEL}'). "
+               f"Ground detections will be empty until the path is fixed.")
         print(f"Warning: {msg}")
         warnings.append(msg)
 
@@ -1027,17 +1027,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                   mode="combined", frame_skip=None, progress_callback=None,
                   motion_compensation=None, boundary=None,
                   inner_margin_m=DEFAULT_INNER_MARGIN_M, grid_cell_m=DEFAULT_GRID_CELL_M):
-    """
-    progress_callback: optional fn(done_frames, total_frames) -- Streamlit progress bar
-                       ke liye. None ho to kuch nahi hota (CLI ke liye safe).
-    frame_skip: None ho to global FRAME_SKIP use hoti hai.
-    motion_compensation: True/False to force drone-motion compensation (ground-fixed zones)
-                       on/off. None -> use the MOTION_COMPENSATION config flag.
-    boundary: the user's OUTER (flight) boundary as [(lat, lon), ...] or [{"lat":..,"lon":..}, ...].
-              Detection / analysis runs only inside it and every coordinate is derived from it.
-              None -> the video is still analysed, but no coordinates / GIS layers are produced.
-    inner_margin_m / grid_cell_m: margin around the infected points' hull and spray-grid cell size.
-    """
     skip = int(frame_skip) if frame_skip else FRAME_SKIP
     skip = max(1, skip)
 
@@ -1046,6 +1035,24 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     print(f"Device: {DEVICE} | frame_skip: {skip} | imgsz: {IMG_SIZE} | SAHI: {USE_SAHI}")
 
     ground_model, aerial_model, ground_class_map, sahi_ground_model, model_warnings = load_models()
+
+    model_warnings = list(model_warnings)
+    keep_ids, missing_names = resolve_keep_ids(ground_class_map)
+    keep_id_set = set(keep_ids) if keep_ids else None
+    if ground_model is not None:
+        print(f"Ground model classes ({len(ground_class_map)}): {dict(ground_class_map)}")
+        if keep_ids:
+            print(f"Class filter ON: {len(keep_ids)} classes kept -> "
+                  f"{[ground_class_map[i] for i in keep_ids]}")
+        elif KEEP_CLASS_NAMES:
+            msg = ("None of the KEEP_CLASS_NAMES entries matched model.names -- "
+                   "class filter is OFF (all classes are running). Check the spelling.")
+            print(f"Warning: {msg}")
+            model_warnings.append(msg)
+        if keep_ids and missing_names:
+            msg = f"These names were not found in the model (ignored): {missing_names}"
+            print(f"Warning: {msg}")
+            model_warnings.append(msg)
 
     cap = cv2.VideoCapture(resolved_path)
     if not cap.isOpened():
@@ -1056,7 +1063,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     src_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_src_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
 
-    # --- Downscale for speed ---
     scale = 1.0
     if src_width > PROCESS_MAX_WIDTH:
         scale = PROCESS_MAX_WIDTH / float(src_width)
@@ -1068,8 +1074,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(temp_raw_video, fourcc, max(1.0, fps / skip), (width, height))
 
-    # --- Pass 1: estimate the drone's motion and build the GROUND-FIXED zone grid ---
-    # (see the "WORLD-FIXED ZONES" section above for the reasoning)
     use_motion = MOTION_COMPENSATION if motion_compensation is None else bool(motion_compensation)
     motion_failures = 0
     homographies = []
@@ -1079,11 +1083,10 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             resolved_path, skip, width, height, total_src_frames, progress_callback)
         motion_failures = motion_estimator.failures
     if not homographies:
-        homographies = [np.eye(3, dtype=np.float64)]   # static camera / tracking disabled
+        homographies = [np.eye(3, dtype=np.float64)]
 
     world = WorldGrid(homographies, width, height, GRID_ROWS, GRID_COLS)
 
-    # --- GIS: fit the flown ground area onto the user's outer boundary (no demo coordinates) ---
     outer_ll = boundary_polygon(boundary)
     if boundary and outer_ll is None:
         raise ValueError("The field boundary needs at least 3 valid vertices.")
@@ -1101,7 +1104,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     print(f"World extent: {world.x1 - world.x0:.0f} x {world.y1 - world.y0:.0f} px "
           f"(camera frame: {width} x {height} px) | motion-tracking failures: {motion_failures}")
 
-    # Per-zone histories only receive a value in frames where that zone is visible
     zone_history = {(r, c): [] for r in range(GRID_ROWS) for c in range(GRID_COLS)}
     zone_coverage_history = {(r, c): [] for r in range(GRID_ROWS) for c in range(GRID_COLS)}
     zone_det_count_history = {(r, c): [] for r in range(GRID_ROWS) for c in range(GRID_COLS)}
@@ -1115,16 +1117,13 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     zone_class_tally = {(r, c): {} for r in range(GRID_ROWS) for c in range(GRID_COLS)}
     zone_thumbnails = {(r, c): None for r in range(GRID_ROWS) for c in range(GRID_COLS)}
 
-    # Tracks live in WORLD coordinates, so a pest keeps its identity while the drone moves and
-    # when it re-enters the view later (overlapping flight lines). Tracks never expire.
     tracker = SpatialTemporalTracker(max_disappeared_frames=10 ** 9,
                                      distance_threshold_px=TRACK_MATCH_DISTANCE_WORLD_PX)
 
     per_frame_report = []
 
-    # Real positions of the infected points (all in world / ground coordinates)
-    track_acc = {}      # track_id -> running mean ground position of one unique pest
-    stress_acc = {}     # (row, col) -> weighted sum of the crop-stress pixel centroids
+    track_acc = {}
+    stress_acc = {}
 
     frame_idx = 0
     processed_frames = 0
@@ -1160,23 +1159,22 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 pass
 
         frame = apply_clahe(frame)
-        analysis_frame = frame.copy()   # clean copy (no drawings) used for colour/texture analysis
+        analysis_frame = frame.copy()
 
-        # Camera pose of this frame: frame pixels -> world (ground) coordinates
         H_cur = homographies[min(processed_frames - 1, len(homographies) - 1)]
         H_inv = np.linalg.inv(H_cur)
 
         zone_counts = {k: 0 for k in zone_history}
         box_mask = np.zeros((height, width), dtype=np.uint8)
 
-        # Outer boundary projected into this frame: pixels outside it are never analysed
         field_mask = None
         if field_poly_world is not None:
-            fp = cv2.perspectiveTransform(field_poly_world.reshape(-1, 1, 2),
-                                          np.asarray(H_inv, dtype=np.float64)).reshape(-1, 2)
-            fp = np.clip(fp, -1e5, 1e5)
             field_mask = np.zeros((height, width), dtype=np.uint8)
-            cv2.fillPoly(field_mask, [np.round(fp).astype(np.int32)], 255)
+            for poly_w in field_poly_world:
+                fp = cv2.perspectiveTransform(poly_w.reshape(-1, 1, 2),
+                                              np.asarray(H_inv, dtype=np.float64)).reshape(-1, 2)
+                fp = np.clip(fp, -1e5, 1e5)
+                cv2.fillPoly(field_mask, [np.round(fp).astype(np.int32)], 255)
 
         ground_boxes = []
         aerial_boxes = []
@@ -1193,12 +1191,15 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 verbose=0
             )
             for pred in sliced_result.object_prediction_list:
+                if keep_id_set is not None and int(pred.category.id) not in keep_id_set:
+                    continue
                 bbox = pred.bbox
                 pseudo_box = PseudoBox(bbox.minx, bbox.miny, bbox.maxx, bbox.maxy,
                                         pred.score.value, pred.category.id)
                 ground_boxes.append((pseudo_box, ground_class_map, (255, 100, 0)))
         elif ground_model is not None and mode in ["ground", "combined"]:
             res_g = ground_model.predict(frame, imgsz=IMG_SIZE, conf=CONF_THRESHOLD,
+                                         classes=keep_ids,
                                          device=DEVICE, verbose=False)[0]
             for b in res_g.boxes:
                 ground_boxes.append((b, ground_class_map, (255, 100, 0)))
@@ -1210,7 +1211,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 aerial_boxes.append((b, aerial_model.names, (0, 200, 255)))
 
         all_detected_boxes = ground_boxes + aerial_boxes
-        # --- Intra-Frame Multi-Model NMS Deduplication ---
         all_detected_boxes = suppress_overlapping_boxes(all_detected_boxes, iou_threshold=0.45)
 
         current_frame_dets = []
@@ -1230,12 +1230,8 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             class_id = int(box.cls[0])
             class_label = name_map.get(class_id, f"class_{class_id}")
 
-            # Position of this detection on the GROUND (world coordinates), and the
-            # ground-fixed zone it belongs to. The zone no longer depends on where the
-            # camera happens to point.
             wx, wy = world.point_to_world(H_cur, cx, cy)
 
-            # Detection runs ONLY inside the user's outer boundary
             if geo is not None and not geo.contains_world(wx, wy):
                 total_rejected_outside_boundary += 1
                 continue
@@ -1249,7 +1245,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 "conf": conf_val, "box": box, "name_map": name_map, "color_box": color_box
             })
 
-        # --- Inter-Frame Spatial-Temporal Tracking & Object Deduplication ---
         tracked_dets = tracker.update(current_frame_dets)
 
         for det in tracked_dets:
@@ -1269,19 +1264,16 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             entry = class_tally.setdefault(class_label, {"count": 0, "conf_sum": 0.0, "conf_n": 0,
                                                          "conf_min": 1.0, "conf_max": 0.0})
             if det["is_new"]:
-                entry["count"] += 1     # unique physical pests
+                entry["count"] += 1
             entry["conf_sum"] += conf_val
-            entry["conf_n"] += 1        # number of observations (frames) behind conf_sum
+            entry["conf_n"] += 1
             entry["conf_min"] = min(entry["conf_min"], conf_val)
             entry["conf_max"] = max(entry["conf_max"], conf_val)
 
             zone_counts[(row, col)] += 1
             if det["is_new"]:
-                # Count every physical pest ONCE per zone, not once per frame it appears in.
-                # (Overlapping frames show the same pest several times.)
                 zone_class_tally[(row, col)][class_label] = zone_class_tally[(row, col)].get(class_label, 0) + 1
 
-            # Union of all boxes of this frame; used for the per-zone coverage ratio
             cv2.rectangle(box_mask, (int(x1), int(y1)), (int(x2), int(y2)), 255, -1)
 
             cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color_box, 3)
@@ -1294,26 +1286,24 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         frame_zone_report = {}
+        zone_overlay = {}
         for (row, col) in zone_history:
-            # Project this GROUND-FIXED zone into the current frame. Returns None when the
-            # zone is (almost) outside the camera view -> no observation for this frame.
             view = world.project_cell(row, col, H_inv, width, height, min_visible_px)
             if view is None:
                 continue
 
             x_start, y_start, x_end, y_end = view["x0"], view["y0"], view["x1"], view["y1"]
-            zw, zh = x_end - x_start, y_end - y_start          # size of the visible part
-            cell_mask = view["mask"]                            # visible pixels of THIS zone only
+            zw, zh = x_end - x_start, y_end - y_start
+            cell_mask = view["mask"]
             visible_px = view["visible_px"]
             if field_mask is not None:
-                # keep only the part of the zone that lies inside the outer boundary
                 cell_mask = cv2.bitwise_and(cell_mask, field_mask[y_start:y_end, x_start:x_end])
                 visible_px = cv2.countNonZero(cell_mask)
                 if visible_px < min_visible_px:
                     continue
 
             det_cnt = zone_counts[(row, col)]
-            zone_crop = analysis_frame[y_start:y_end, x_start:x_end]   # clean pixels (no drawings)
+            zone_crop = analysis_frame[y_start:y_end, x_start:x_end]
             annotated_crop = frame[y_start:y_end, x_start:x_end]
             if annotated_crop.size > 0 and (zone_thumbnails[(row, col)] is None or (det_cnt > 0 and processed_frames % 5 == 0)):
                 try:
@@ -1325,8 +1315,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 except Exception:
                     pass
 
-            # Share of the VISIBLE part of the zone that is covered by detection boxes
-            # (union of boxes, so overlapping boxes are not double counted)
             box_in_zone = cv2.bitwise_and(box_mask[y_start:y_end, x_start:x_end], cell_mask)
             coverage_ratio = cv2.countNonZero(box_in_zone) / float(visible_px)
 
@@ -1344,12 +1332,11 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 combined_ratio = max(coverage_ratio, 0.5 * unhealthy_ratio, 0.4 * tex_anomaly)
             elif mode == "aerial":
                 combined_ratio = max(coverage_ratio, unhealthy_ratio, 0.3 * tex_anomaly, 0.3 * wilt_score)
-            else:  # "combined"
+            else:
                 combined_ratio = max(coverage_ratio, unhealthy_ratio, 0.3 * tex_anomaly, 0.3 * wilt_score)
 
             severity = get_severity_from_ratio(combined_ratio, det_cnt, mode=mode)
 
-            # Where is the crop stress in this zone? (ground position of the unhealthy pixels)
             if (geo is not None and color_res["unhealthy_cx"] is not None
                     and unhealthy_ratio >= SEVERITY_THRESHOLDS["low"]):
                 swx, swy = world.point_to_world(H_cur, x_start + color_res["unhealthy_cx"],
@@ -1371,53 +1358,14 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             zone_wilting_history[(row, col)].append(wilt_score)
             zone_combined_ratio_history[(row, col)].append(combined_ratio)
 
-            color = COLORS[severity]
             zone_lat, zone_lon = zone_gps[(row, col)]
-
-            # Ground-fixed zone outline: it follows the ground (not the camera) as the drone moves
-            cv2.polylines(frame, [view["poly"]], True, (255, 255, 0), 1)
-            cv2.polylines(frame, [view["poly"]], True, color, 2)
-
-            # Zone number label: the same ground area always keeps the same number
-            zone_label = f"Z{row * GRID_COLS + col + 1}"
-            cv2.putText(frame, zone_label, (x_start + 5, y_start + zh - 8),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-
-            if severity != "none":
-                dose = SPRAY_DOSE[severity]
-                label = f"{severity.upper()} - Spray {dose}%"
-                sub_label = f"Discolor:{unhealthy_ratio*100:.1f}% Tex:{tex_anomaly:.2f}"
-
-                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(frame, (x_start + 5, y_start + 5),
-                             (x_start + 15 + max(label_size[0], 180), y_start + 45), color, -1)
-                cv2.putText(frame, label, (x_start + 10, y_start + 23),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(frame, sub_label, (x_start + 10, y_start + 40),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-                # GPS shown in all modes (only when a real boundary / georeference exists)
-                if zone_lat is not None and zone_lon is not None:
-                    gps_label = f"GPS: {zone_lat}, {zone_lon}"
-                    gps_size, _ = cv2.getTextSize(gps_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-                    gps_y = y_start + zh - 30
-                    cv2.rectangle(frame, (x_start + 5, gps_y - 18),
-                                 (x_start + 15 + gps_size[0], gps_y + 6), (0, 0, 0), -1)
-                    cv2.putText(frame, gps_label, (x_start + 10, gps_y),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
-
-                # --- Simulated spray action (visual demo, no hardware) ---
-                random.seed(frame_idx * 100 + row * 3 + col)
-                num_droplets = int(dose / 10)
-                for _ in range(num_droplets):
-                    dx = random.randint(x_start + 10, max(x_start + 11, x_start + zw - 10))
-                    dy = random.randint(y_start + 55, max(y_start + 56, y_start + zh - 10))
-                    cv2.circle(frame, (dx, dy), 4, (255, 200, 0), -1)
-                    cv2.circle(frame, (dx, dy), 6, (255, 200, 0), 1)
-
-                cv2.putText(frame, "SPRAYING...",
-                           (x_start + 10, y_start + zh - 15),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 2)
+            zone_overlay[(row, col)] = {
+                "severity": severity,
+                "unhealthy_ratio": unhealthy_ratio,
+                "tex_anomaly": tex_anomaly,
+                "lat": zone_lat,
+                "lon": zone_lon,
+            }
 
             frame_zone_report[f"zone_{row}_{col}"] = {
                 "severity": severity,
@@ -1431,6 +1379,8 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
                 "longitude": zone_lon,
             }
 
+        _draw_fixed_zone_overlay(frame, world, H_cur, zone_overlay)
+
         out.write(frame)
 
         per_frame_report.append({
@@ -1443,7 +1393,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
     cap.release()
     out.release()
 
-    # --- Re-encode to browser-compatible H.264 (libx264, yuv420p) ---
     if FFMPEG_EXE and os.path.exists(temp_raw_video):
         try:
             print(f"Re-encoding annotated video to H.264 via FFmpeg ({output_video})...")
@@ -1498,7 +1447,7 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
         p95_wilting = float(np.percentile(wiltings, 95))
 
         if mode == "ground":
-            observed_frames = len(history)   # frames in which this ground zone was actually visible
+            observed_frames = len(history)
             sustained_presence = int(np.sum(dets > 0)) >= max(1, int(observed_frames * 0.01))
             sustained_severity = get_severity_from_ratio(p95_combined if sustained_presence else 0.0, det_cnt=1 if sustained_presence else 0, mode=mode)
         else:
@@ -1508,7 +1457,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
 
         zone_lat, zone_lon = zone_gps[(row, col)]
 
-        # Dominant pest/disease class detected in this zone (if any)
         zone_classes = zone_class_tally[(row, col)]
         dominant_class = None
         dominant_class_count = 0
@@ -1544,7 +1492,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             "prevention_advice": prevention_advice,
         }
 
-    # --- Infected points -> inner boundary -> spray grid (all automatic, all GIS) ---
     infected_points = []
     gis_result = None
     if geo is not None:
@@ -1558,7 +1505,7 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
             zones_with_detection.add((row, col))
             sev = _zone_sev((row, col))
             if severity_rank[sev] < severity_rank["low"]:
-                sev = "low"                     # a confirmed detection is never "healthy"
+                sev = "low"
             lon, lat = geo.world_to_lonlat(wx, wy)
             infected_points.append({
                 "point_id": len(infected_points) + 1, "source": "detection",
@@ -1589,7 +1536,6 @@ def process_video(video_path=DEFAULT_VIDEO, output_video=OUTPUT_VIDEO, report_pa
         print(f"GIS: {len(infected_points)} infected points | inner boundary "
               f"{gis_result['inner_area_m2']:.0f} m2 | spray grid cells: {len(gis_result['grid'])}")
 
-    # Non-zone metadata block (dashboards that only read "zone_r_c" keys can ignore it)
     report["_meta"] = {
         "ground_fixed_zones": bool(use_motion),
         "frames_analyzed": processed_frames,
@@ -1663,11 +1609,11 @@ if __name__ == "__main__":
         if os.path.isfile(args.boundary):
             with open(args.boundary, "r", encoding="utf-8") as bf:
                 data = json.load(bf)
-            if isinstance(data, dict) and "coordinates" in data:            # GeoJSON Polygon
+            if isinstance(data, dict) and "coordinates" in data:
                 boundary_arg = [(pt[1], pt[0]) for pt in data["coordinates"][0]]
-            elif isinstance(data, dict) and "features" in data:             # GeoJSON FeatureCollection
+            elif isinstance(data, dict) and "features" in data:
                 boundary_arg = [(pt[1], pt[0]) for pt in data["features"][0]["geometry"]["coordinates"][0]]
-            else:                                                           # [{"lat":..,"lon":..}, ...]
+            else:
                 boundary_arg = data
         else:
             boundary_arg = [tuple(float(v) for v in pair.split(",")) for pair in args.boundary.split(";") if pair.strip()]
