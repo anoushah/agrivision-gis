@@ -5394,54 +5394,54 @@ def inject_custom_styles(theme_mode, lang_code):
 
 
     @media (min-width: 769px) {
-        section[data-testid="stSidebar"][aria-expanded="false"] {
+        [data-testid="stSidebar"][aria-expanded="false"] {
             position: fixed !important; left: 0 !important; top: 0 !important; height: 100vh !important;
             transform: none !important; margin: 0 !important; visibility: visible !important; opacity: 1 !important;
             display: block !important; width: 72px !important; min-width: 72px !important; max-width: 72px !important;
             overflow: hidden !important; z-index: 999 !important;
         }
-        section[data-testid="stSidebar"][aria-expanded="false"] > div, section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarContent"] { width: 72px !important; min-width: 72px !important; transform: none !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarHeader"],
-        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarResizeHandle"],
-        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarCollapseButton"],
-        section[data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand-text,
-        section[data-testid="stSidebar"][aria-expanded="false"] .sidebar-status,
-        section[data-testid="stSidebar"][aria-expanded="false"] hr { display: none !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stElementContainer"]:has(.sidebar-brand) {
+        [data-testid="stSidebar"][aria-expanded="false"] > div, [data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarContent"] { width: 72px !important; min-width: 72px !important; transform: none !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarHeader"],
+        [data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarResizeHandle"],
+        [data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarCollapseButton"],
+        [data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand-text,
+        [data-testid="stSidebar"][aria-expanded="false"] .sidebar-status,
+        [data-testid="stSidebar"][aria-expanded="false"] hr { display: none !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] [data-testid="stElementContainer"]:has(.sidebar-brand) {
             position: fixed !important; left: 16px !important; top: 16px !important; width: 40px !important; height: 40px !important;
             display: flex !important; align-items: center !important; justify-content: center !important; margin: 0 !important; z-index: 1000;
         }
-        section[data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand {
+        [data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand {
             width: 40px !important; height: 40px !important; justify-content: center !important; align-items: center !important;
             border-bottom: none !important; margin: 0 !important; padding: 0 !important; cursor: pointer;
         }
-        section[data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand .brand-logo { font-size: 24px !important; line-height: 1 !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] [class*="st-key-nav_btn_"] {
+        [data-testid="stSidebar"][aria-expanded="false"] .sidebar-brand .brand-logo { font-size: 24px !important; line-height: 1 !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] [class*="st-key-nav_btn_"] {
             position: fixed !important; left: 16px !important; width: 40px !important; height: 40px !important;
             margin: 0 !important; padding: 0 !important; z-index: 1000;
         }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_home { top: 72px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_visual_report { top: 120px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_gps { top: 168px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_problems { top: 216px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_spray { top: 264px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_pests { top: 312px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_settings { top: 360px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] [class*="st-key-nav_btn_"] [data-testid="stButton"] { width: 40px !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .stButton button {
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_home { top: 72px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_visual_report { top: 120px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_gps { top: 168px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_problems { top: 216px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_spray { top: 264px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_pests { top: 312px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .st-key-nav_btn_settings { top: 360px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] [class*="st-key-nav_btn_"] [data-testid="stButton"] { width: 40px !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .stButton button {
             width: 40px !important; min-width: 40px !important; height: 40px !important; min-height: 40px !important; padding: 0 !important;
             display: flex !important; align-items: center !important; justify-content: center !important;
             margin: 0 !important; border-radius: 12px !important;
         }
-        section[data-testid="stSidebar"][aria-expanded="false"] .stButton button [data-testid="stMarkdownContainer"] { display: none !important; }
-        section[data-testid="stSidebar"][aria-expanded="false"] .stButton button [data-testid="stIconEmoji"],
-        section[data-testid="stSidebar"][aria-expanded="false"] .stButton button span { margin: 0 !important; font-size: 18px !important; line-height: 1 !important; }
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) .block-container { padding-left: 92px !important; }
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stExpandSidebarButton"],
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stSidebarCollapsedControl"],
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) [data-testid="collapsedControl"],
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) button[data-testid="stExpandSidebarButton"],
-        .stApp:has(section[data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stExpandSidebarButton"] button {
+        [data-testid="stSidebar"][aria-expanded="false"] .stButton button [data-testid="stMarkdownContainer"] { display: none !important; }
+        [data-testid="stSidebar"][aria-expanded="false"] .stButton button [data-testid="stIconEmoji"],
+        [data-testid="stSidebar"][aria-expanded="false"] .stButton button span { margin: 0 !important; font-size: 18px !important; line-height: 1 !important; }
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) .block-container { padding-left: 92px !important; }
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stExpandSidebarButton"],
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stSidebarCollapsedControl"],
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) [data-testid="collapsedControl"],
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) button[data-testid="stExpandSidebarButton"],
+        .stApp:has([data-testid="stSidebar"][aria-expanded="false"]) [data-testid="stExpandSidebarButton"] button {
             position: fixed !important; left: -200px !important; top: 0 !important; opacity: 0 !important; pointer-events: none !important;
         }
     }
@@ -5634,6 +5634,20 @@ function applyVideoAndMenuRules() {
             }
         });
 
+        const sbEl = doc.querySelector('[data-testid="stSidebar"]');
+        if (sbEl) {
+            const hasExpandBtn = !!doc.querySelector('[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"]');
+            if (hasExpandBtn) {
+                if (sbEl.getAttribute('aria-expanded') !== 'false') {
+                    sbEl.setAttribute('aria-expanded', 'false');
+                    sbEl.setAttribute('data-agri-forced', '1');
+                }
+            } else if (sbEl.getAttribute('data-agri-forced') === '1') {
+                sbEl.removeAttribute('data-agri-forced');
+                sbEl.removeAttribute('aria-expanded');
+            }
+        }
+
         doc.querySelectorAll('.metric-value').forEach(el => {
             if (el.dataset.counted) return;
             el.dataset.counted = "1";
@@ -5665,7 +5679,7 @@ function bindLogoOpensSidebar() {
         pdoc.addEventListener('click', function(e) {
             const brand = e.target && e.target.closest ? e.target.closest('.sidebar-brand') : null;
             if (!brand) return;
-            const sb = pdoc.querySelector('section[data-testid="stSidebar"]');
+            const sb = pdoc.querySelector('[data-testid="stSidebar"]');
             if (!sb || sb.getAttribute('aria-expanded') !== 'false') return;
             const el = pdoc.querySelector('[data-testid="stExpandSidebarButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"]');
             if (!el) return;
